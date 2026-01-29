@@ -35,11 +35,9 @@ def safe_float(value, default=0.0):
         s_val = str(value).strip().upper()
         if not s_val: return default
         
-        # 줄바꿈, 괄호 제거
         for sep in ['\n', '(', '\r']:
             if sep in s_val: s_val = s_val.split(sep)[0].strip()
         
-        # '/' 처리 (기본: 앞의 숫자만)
         if "/" in s_val:
             parts = s_val.split("/")
             if parts[0].strip(): s_val = parts[0]
@@ -120,7 +118,7 @@ def safe_write(ws, coord, value):
 # ============================================================================
 def extract_header_info(ws):
     extracted = {"car": "", "vol": 0}
-    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=50, values_only=True)):
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=150, values_only=True)):
         for j, cell in enumerate(row):
             if not cell: continue
             s_val = str(cell).replace(" ","").upper()
@@ -139,13 +137,12 @@ def parse_part_list_dynamic(file):
         ws = wb.active
         
         parsed_items = []
-        header_info = extract_header_info(ws)
+        header_info = extract_header_info(ws) # 여기서 header_info로 받음
         
         all_rows = list(ws.iter_rows(values_only=True))
         header_row_index = -1
         col_map = {'part_no': 7, 'name': 8, 'qty': [], 'mat': 22, 'ton': 23, 'cav': 24, 'L':10, 'W':11, 'H':12} 
         
-        # [Step 1] 헤더 행 찾기
         for i, r in enumerate(all_rows):
             row_str = " ".join([str(x) for x in r if x]).replace(" ", "").upper()
             if "PARTNO" in row_str or "품번" in row_str:
@@ -153,7 +150,6 @@ def parse_part_list_dynamic(file):
                 row1 = r
                 row2 = all_rows[i+1] if i+1 < len(all_rows) else [None]*len(r)
                 
-                # 1. 윗줄 분석
                 for idx, cell in enumerate(row1):
                     if not cell: continue
                     c_val = str(cell).upper().replace(" ", "").replace("\n", "")
@@ -165,7 +161,6 @@ def parse_part_list_dynamic(file):
                     if "QTY" in c_val or "수량" in c_val or "USG" in c_val:
                         if idx not in col_map['qty']: col_map['qty'].append(idx)
                             
-                # 2. 아랫줄 분석
                 for idx, cell in enumerate(row2):
                     if not cell: continue
                     c_val = str(cell).upper().replace(" ", "").replace("\n", "")
@@ -182,10 +177,8 @@ def parse_part_list_dynamic(file):
 
         if header_row_index == -1: header_row_index = 5 
 
-        # [Step 2] 데이터 파싱
         for i in range(header_row_index + 1, len(all_rows)):
             r = list(all_rows[i])
-            # [수정] 패딩을 100까지 늘려서 IndexError 방지
             if len(r) < 100: r.extend([None] * (100 - len(r)))
             
             p_idx = col_map.get('part_no', 7)
@@ -199,7 +192,6 @@ def parse_part_list_dynamic(file):
             n_idx = col_map.get('name', 8)
             rem_val = str(r[n_idx + 1] if n_idx + 1 < len(r) and r[n_idx+1] else "")
             
-            # 사출품 판단
             t_idx = col_map.get('ton', 28)
             m_idx = col_map.get('mat', 27) 
             raw_ton = r[t_idx] if t_idx < len(r) else None
@@ -208,17 +200,14 @@ def parse_part_list_dynamic(file):
             if not safe_float(raw_ton) and (not raw_mat or str(raw_mat).strip() == ""):
                 continue
 
-            # ▼▼▼ [확정] 수량(Usage) 1/1 -> 1 (단순 safe_float) ▼▼▼
             usage = 1.0
             if col_map.get('qty'):
                 max_q = 0
                 for q_idx in col_map['qty']:
                     if q_idx < len(r):
-                        # safe_float는 1/1을 1로 반환하므로 OK
                         v = safe_float(r[q_idx])
                         if v > max_q: max_q = v
                 if max_q > 0: usage = max_q
-            # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
             p_name = str(r[n_idx]).strip() if n_idx < len(r) and r[n_idx] else ""
             
@@ -243,13 +232,11 @@ def parse_part_list_dynamic(file):
 
             ton = int(safe_float(raw_ton, default=1300))
             
-            # ▼▼▼ [확정] Cavity 1/1 -> 2 (합산 로직) ▼▼▼
             cv_idx = col_map.get('cav', t_idx + 1)
             raw_cav = str(r[cv_idx]) if cv_idx < len(r) else "1"
             
             if "/" in raw_cav:
                 try:
-                    # 1/1 -> 1+1 = 2
                     cav = int(sum(safe_float(x) for x in raw_cav.split('/') if x.strip()))
                 except:
                     cav = int(safe_float(raw_cav, default=1))
@@ -257,7 +244,6 @@ def parse_part_list_dynamic(file):
                 cav = int(safe_float(raw_cav, default=1))
             
             if cav < 1: cav = 1
-            # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
             item = {
                 "id": str(uuid.uuid4()),
@@ -276,10 +262,10 @@ def parse_part_list_dynamic(file):
             }
             parsed_items.append(item)
 
-        return parsed_items, extracted_info
+        # ▼▼▼ [수정완료] extracted_info -> header_info로 수정 ▼▼▼
+        return parsed_items, header_info 
 
     except Exception as e:
-        # 에러 발생 시 상세 내용을 화면에 출력 (디버깅용)
         st.error(f"데이터 분석 중 오류 발생: {e}")
         st.code(traceback.format_exc())
         return [], {}
@@ -308,8 +294,6 @@ def generate_excel_batch_sheets(common, items, sel_year):
         safe_write(ws, "N3", common['car'])
         safe_write(ws, "C3", item['no'])    
         safe_write(ws, "C4", item['name']) 
-        
-        # [삭제됨] A3 작성 코드 제거 (사장님 요청)
         
         curr_m = MAT_START_ROW
         

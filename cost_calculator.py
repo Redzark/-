@@ -35,20 +35,14 @@ def safe_float(value, default=0.0):
         if value is None: return default
         s_val = str(value).strip().upper()
         if not s_val: return default
-        
-        # 괄호, 줄바꿈 제거
         for sep in ['\n', '(', '\r']:
             if sep in s_val: s_val = s_val.split(sep)[0].strip()
-        
-        # '/'가 있으면 앞의 숫자만 가져옴 (U/S 1/1 -> 1 유지)
         if "/" in s_val:
             parts = s_val.split("/")
             if parts[0].strip(): s_val = parts[0]
-        
         clean_val = re.sub(r"[^0-9.]", "", s_val)
         if not clean_val: return default
         if clean_val == ".": return default
-        
         return float(clean_val)
     except: return default
 
@@ -117,11 +111,10 @@ def safe_write(ws, coord, value):
     except Exception: pass
 
 # ============================================================================
-# 3. PART LIST 파싱 함수 (Matrix 대응: 기둥별 자동 분리)
+# 3. PART LIST 파싱 함수 (Matrix 대응 & 헤더 추출)
 # ============================================================================
 def extract_header_info(ws):
     extracted = {"car": "", "vol": 0}
-    # [유지] 범위 150행까지 넉넉하게
     for i, row in enumerate(ws.iter_rows(min_row=1, max_row=150, values_only=True)):
         for j, cell in enumerate(row):
             if not cell: continue
@@ -139,12 +132,9 @@ def parse_part_list_matrix(file):
     try:
         wb = openpyxl.load_workbook(file, data_only=True)
         ws = wb.active
-        
-        # 1. 공통 정보 (차종, 볼륨)
         header_info = extract_header_info(ws)
         all_rows = list(ws.iter_rows(values_only=True))
         
-        # 2. 헤더 찾기 (PART NO)
         header_row_index = -1
         col_map = {'part_no': 7, 'name': 8, 'qty_cols': [], 'mat': 22, 'ton': 23, 'cav': 24, 'L':10, 'W':11, 'H':12} 
         
@@ -155,7 +145,6 @@ def parse_part_list_matrix(file):
                 row1 = r
                 row2 = all_rows[i+1] if i+1 < len(all_rows) else [None]*len(r)
                 
-                # 윗줄 (Qty 열 찾기)
                 for idx, cell in enumerate(row1):
                     if not cell: continue
                     c_val = str(cell).upper().replace(" ", "").replace("\n", "")
@@ -164,11 +153,9 @@ def parse_part_list_matrix(file):
                     elif "MATERIAL" in c_val or "재질" in c_val: col_map['mat'] = idx
                     elif "THICK" in c_val or "두께" in c_val: col_map['thick'] = idx
                     elif "WEIGHT" in c_val or "중량" in c_val: col_map['weight'] = idx
-                    # [핵심] QTY 컬럼 모두 수집
                     if "QTY" in c_val or "수량" in c_val or "USG" in c_val:
                         if idx not in col_map['qty_cols']: col_map['qty_cols'].append(idx)
                             
-                # 아랫줄 (Qty 열 추가 확인 및 스펙 찾기)
                 for idx, cell in enumerate(row2):
                     if not cell: continue
                     c_val = str(cell).upper().replace(" ", "").replace("\n", "")
@@ -185,35 +172,25 @@ def parse_part_list_matrix(file):
 
         if header_row_index == -1: header_row_index = 5 
 
-        # 3. [핵심] 각 기둥(Qty 열)별로 나누어 담기
-        assy_dict = {} # {"ASSY명": [부품리스트], ...}
-
+        assy_dict = {} 
         for q_col in col_map['qty_cols']:
-            # 3-1. 이 기둥의 주인(ASSY 이름) 찾기
             assy_name = f"ASSY_Type_{q_col}" 
-            # (옵션) 해당 열 최상단에 있는 품번을 ASSY명으로 쓰기
             for i in range(header_row_index + 1, len(all_rows)):
                 r = list(all_rows[i])
                 if len(r) > q_col and safe_float(r[q_col]) > 0:
-                    # 해당 열에 수량이 있는 첫 번째 놈의 품번을 파일명으로
                     temp_no = str(r[col_map['part_no']]).strip()
                     if temp_no and "None" not in temp_no:
                         assy_name = temp_no.replace("/", "_").replace("*", "")
                         break
             
-            # 3-2. 부품 긁어모으기
             items_in_assy = []
-            
             for i in range(header_row_index + 1, len(all_rows)):
                 r = list(all_rows[i])
-                # [유지] 100칸 패딩 (안전장치)
                 if len(r) < 100: r.extend([None] * (100 - len(r)))
                 
-                # 해당 열(q_col)에 수량이 없으면 이 ASSY 부품 아님 -> 스킵
-                u_val_raw = safe_float(r[q_col]) # 1/1 -> 1 (유지)
+                u_val_raw = safe_float(r[q_col]) 
                 if u_val_raw <= 0: continue
 
-                # 파싱 시작
                 p_idx = col_map.get('part_no', 7)
                 if not r[p_idx]: continue
                 p_no_str = str(r[p_idx]).strip()
@@ -224,7 +201,6 @@ def parse_part_list_matrix(file):
                 n_idx = col_map.get('name', 8)
                 rem_val = str(r[n_idx + 1] if n_idx + 1 < len(r) and r[n_idx+1] else "")
                 
-                # 사출품 여부 판단
                 t_idx = col_map.get('ton', 28)
                 m_idx = col_map.get('mat', 27) 
                 raw_ton = r[t_idx] if t_idx < len(r) else None
@@ -233,7 +209,6 @@ def parse_part_list_matrix(file):
                 if not safe_float(raw_ton) and (not raw_mat or str(raw_mat).strip() == ""):
                     continue
 
-                # 데이터 추출 (기존 로직 100% 동일)
                 p_name = str(r[n_idx]).strip() if n_idx < len(r) and r[n_idx] else ""
                 l = safe_float(r[col_map.get('L', 13)])
                 w = safe_float(r[col_map.get('W', 14)])
@@ -253,7 +228,6 @@ def parse_part_list_matrix(file):
 
                 ton = int(safe_float(raw_ton, default=1300))
                 
-                # [유지] Cavity 1/1 -> 2 로직
                 cv_idx = col_map.get('cav', t_idx + 1)
                 raw_cav = str(r[cv_idx]) if cv_idx < len(r) else "1"
                 if "/" in raw_cav:
@@ -270,7 +244,7 @@ def parse_part_list_matrix(file):
                     "name": p_name,
                     "remarks": rem_val,
                     "opt_rate": 100.0,
-                    "usage": u_val_raw, # 해당 기둥의 수량 사용
+                    "usage": u_val_raw, 
                     "L": l, "W": w, "H": h, "thick": t,
                     "weight": weight_val,
                     "mat": mapped_mat,
@@ -280,9 +254,7 @@ def parse_part_list_matrix(file):
                 }
                 items_in_assy.append(item)
             
-            # 해당 ASSY에 부품이 있으면 저장
             if items_in_assy:
-                # 중복 이름 방지
                 if assy_name in assy_dict: assy_name = f"{assy_name}_{q_col}"
                 assy_dict[assy_name] = items_in_assy
 
@@ -294,9 +266,9 @@ def parse_part_list_matrix(file):
         return {}, {}
 
 # ============================================================================
-# 4. 엑셀 생성 함수 (단일 파일 생성용 - 내부 로직 완전 동일)
+# 4. 엑셀 생성 함수 (수동용 & 매트릭스용 공용)
 # ============================================================================
-def create_excel_bytes(common, items, sel_year):
+def generate_excel_file(common, items, sel_year):
     try:
         wb = openpyxl.load_workbook("template.xlsx")
         template_sheet = wb.active
@@ -305,9 +277,12 @@ def create_excel_bytes(common, items, sel_year):
 
     align_center = Alignment(horizontal='center', vertical='center')
 
+    # 단품/수동 모드에서는 items가 리스트이므로 바로 순회
+    # 파일 하나에 모든 부품을 시트로 만듦 (기존 로직)
     for item in items:
         safe_title = str(item['no']).replace("/", "_").replace("*", "")[:30]
         if "비고" in safe_title or "REMARK" in safe_title: continue
+        if not safe_title: safe_title = "No_Name"
 
         target_sheet = wb.copy_worksheet(template_sheet)
         target_sheet.title = safe_title
@@ -317,7 +292,7 @@ def create_excel_bytes(common, items, sel_year):
         safe_write(ws, "C3", item['no'])    
         safe_write(ws, "C4", item['name']) 
         
-        # [유지] A3 절대 건드리지 않음
+        # [철칙] A3 셀 건드리지 않음
         
         curr_m = MAT_START_ROW
         item_usage = item.get('usage', 1.0)
@@ -383,59 +358,111 @@ def create_excel_bytes(common, items, sel_year):
     output = io.BytesIO(); wb.save(output); return output.getvalue()
 
 # ============================================================================
-# 5. Streamlit UI (ZIP 다운로드 기능 추가)
+# 5. Streamlit UI (통합 버전)
 # ============================================================================
-st.set_page_config(page_title="원가계산서(Matrix)", layout="wide")
-st.title("원가계산서 (다중 ASSY 자동 분할)")
-st.warning("⚠️ PART LIST 엑셀을 올리면, 기둥(Column)별로 ASSY를 자동 인식하여 분리합니다.")
+st.set_page_config(page_title="원가계산서(통합)", layout="wide")
+st.title("원가계산서 (단품/수동 + 자동분해 통합본)")
 
+# 세션 초기화
+if 'manual_items' not in st.session_state: st.session_state.manual_items = []
 if 'assy_dict' not in st.session_state: st.session_state.assy_dict = {}
 if 'common_car' not in st.session_state: st.session_state.common_car = ""
 if 'common_vol' not in st.session_state: st.session_state.common_vol = 0
+if 'excel_data' not in st.session_state: st.session_state.excel_data = None
 
-uploaded_file = st.file_uploader("PART LIST 엑셀 파일(.xlsx)을 올려주세요.", type=["xlsx", "xls"])
+# 모드 선택
+mode = st.radio("작업 모드 선택", ["단품 계산", "ASSY(수동 입력)", "PART LIST 엑셀 업로드(Matrix)"], horizontal=True)
 
-if uploaded_file:
-    if st.button("🔄 데이터 불러오기", type="primary"):
-        with st.spinner("엑셀 분석 및 ASSY 분리 중..."):
-            assy_data, info = parse_part_list_matrix(uploaded_file)
+# ----------------------------------------------------------------------------
+# [MODE 1 & 2] 단품 및 수동 입력 모드
+# ----------------------------------------------------------------------------
+if mode in ["단품 계산", "ASSY(수동 입력)"]:
+    st.info("💡 직접 데이터를 입력하여 계산서를 만듭니다.")
+    
+    # 공통 정보
+    c1, c2, c3 = st.columns(3)
+    car = c1.text_input("차종", value=st.session_state.common_car)
+    base_vol = c2.number_input("기본 Volume (대)", value=int(st.session_state.common_vol) if st.session_state.common_vol else 0)
+
+    # 초기 데이터 세팅
+    if mode == "단품 계산" and not st.session_state.manual_items:
+        st.session_state.manual_items = [{"id":str(uuid.uuid4()), "level":"사출제품", "no":"", "name":"", "opt_rate":100.0, "usage":1.0, "L":0.0, "W":0.0, "H":0.0, "thick":2.5, "weight":0.0, "mat":"무도장 TPO", "ton":1300, "cavity":1, "price":2000}]
+    
+    if mode == "ASSY(수동 입력)":
+        if st.button("➕ 품목 추가"):
+            st.session_state.manual_items.append({"id":str(uuid.uuid4()), "level":"사출제품", "no":"", "name":"", "opt_rate":100.0, "usage":1.0, "L":0.0, "W":0.0, "H":0.0, "thick":2.5, "weight":0.0, "mat":"무도장 TPO", "ton":1300, "cavity":1, "price":2000})
+
+    # 입력 폼
+    for i, item in enumerate(st.session_state.manual_items):
+        uid = item['id']
+        with st.container(border=True):
+            cols = st.columns([2, 2, 2, 1, 1, 0.5])
+            item['no'] = cols[0].text_input("품번", value=item['no'], key=f"n_{uid}")
+            item['name'] = cols[1].text_input("품명", value=item['name'], key=f"nm_{uid}")
+            item['opt_rate'] = cols[2].number_input("옵션율(%)", value=item['opt_rate'], key=f"op_{uid}")
+            item['usage'] = cols[3].number_input("Qty", value=item['usage'], key=f"us_{uid}")
             
+            if mode == "ASSY(수동 입력)":
+                if cols[5].button("🗑️", key=f"d_{uid}"): 
+                    st.session_state.manual_items.pop(i)
+                    st.rerun()
+
+            r = st.columns(5)
+            item['L'] = r[0].number_input("L", value=item['L'], key=f"l_{uid}")
+            item['W'] = r[1].number_input("W", value=item['W'], key=f"w_{uid}")
+            item['H'] = r[2].number_input("H", value=item['H'], key=f"h_{uid}")
+            item['thick'] = r[3].number_input("T", value=item['thick'], key=f"t_{uid}")
+            item['weight'] = r[4].number_input("중량(g)", value=item['weight'], key=f"g_{uid}")
+            
+            r2 = st.columns(3)
+            mat_idx = 0
+            if item['mat'] in MATERIAL_DATA: mat_idx = list(MATERIAL_DATA.keys()).index(item['mat'])
+            item['mat'] = r2[0].selectbox("소재", list(MATERIAL_DATA.keys()), index=mat_idx, key=f"ma_{uid}")
+            
+            ton_keys = list(DIRECT_EXP_TABLE.keys())
+            ton_idx = ton_keys.index(item['ton']) if item['ton'] in ton_keys else ton_keys.index(1300)
+            item['ton'] = r2[1].selectbox("Ton", ton_keys, index=ton_idx, key=f"to_{uid}")
+            
+            item['cavity'] = r2[2].number_input("Cav", min_value=1, value=int(item['cavity']), key=f"ca_{uid}")
+            item['price'] = st.number_input("단가(참고용)", value=item['price'], key=f"pr_{uid}")
+
+    if st.button("엑셀 생성 (Single File)", type="primary"):
+        excel_bytes = generate_excel_file({"car":car, "base_vol":base_vol}, st.session_state.manual_items, 2026)
+        if excel_bytes:
+            st.download_button("📥 다운로드", excel_bytes, "Manual_Cost.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ----------------------------------------------------------------------------
+# [MODE 3] PART LIST 엑셀 업로드 (Matrix)
+# ----------------------------------------------------------------------------
+else:
+    st.info("💡 엑셀을 올리면 기둥(Column)별로 ASSY를 자동 분리하여 ZIP으로 줍니다.")
+    
+    uploaded_file = st.file_uploader("PART LIST 파일 업로드", type=["xlsx", "xls"])
+    if uploaded_file:
+        if st.button("🔄 분석 시작"):
+            assy_data, info = parse_part_list_matrix(uploaded_file)
             if assy_data:
                 st.session_state.assy_dict = assy_data
-                if info.get('car'): st.session_state.common_car = info['car']
-                if info.get('vol'): st.session_state.common_vol = info['vol']
-                st.success(f"✅ 총 {len(assy_data)}개의 ASSY를 찾아냈습니다!")
+                st.session_state.common_car = info.get('car', '')
+                st.session_state.common_vol = info.get('vol', 0)
+                st.success(f"✅ {len(assy_data)}개 ASSY 분리 완료!")
             else:
-                st.error("데이터를 찾을 수 없습니다.")
+                st.error("데이터 없음 (톤수/재질 확인)")
 
-st.markdown("---")
-
-if st.session_state.assy_dict:
-    c1, c2 = st.columns(2)
-    car = c1.text_input("차종", value=st.session_state.common_car)
-    base_vol = c2.number_input("기본 Volume (대)", value=int(st.session_state.common_vol))
-    
-    st.markdown("### 📋 감지된 ASSY 목록")
-    for name, items in st.session_state.assy_dict.items():
-        with st.expander(f"📦 {name} (부품 {len(items)}개)"):
-            for it in items:
-                st.write(f"- {it['no']} : {it['name']} (Qty:{it['usage']}, C/V:{it['cavity']}, Ton:{it['ton']})")
-
-    st.markdown("---")
-    st.markdown("### 💰 엑셀 일괄 생성")
-    
-    if st.button("모든 ASSY 계산서 ZIP으로 다운로드", type="primary", use_container_width=True):
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zf:
-            for assy_name, items in st.session_state.assy_dict.items():
-                excel_bytes = create_excel_bytes({"car":car, "base_vol":base_vol}, items, 2026)
-                if excel_bytes:
-                    zf.writestr(f"{assy_name}_원가계산서.xlsx", excel_bytes)
+    if st.session_state.assy_dict:
+        c1, c2 = st.columns(2)
+        car = c1.text_input("차종", value=st.session_state.common_car, key="m_car")
+        base_vol = c2.number_input("기본 Volume", value=int(st.session_state.common_vol), key="m_vol")
         
-        st.download_button(
-            label="📥 ZIP 파일 다운로드 (Click)",
-            data=zip_buffer.getvalue(),
-            file_name=f"{car}_원가계산서_모음.zip",
-            mime="application/zip",
-            use_container_width=True
-        )
+        st.markdown("---")
+        for name, items in st.session_state.assy_dict.items():
+            with st.expander(f"📦 {name} ({len(items)} items)"):
+                for it in items: st.write(f"- {it['no']} ({it['name']})")
+        
+        if st.button("ZIP 다운로드 (All in One)", type="primary"):
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w") as zf:
+                for name, items in st.session_state.assy_dict.items():
+                    xb = generate_excel_file({"car":car, "base_vol":base_vol}, items, 2026)
+                    if xb: zf.writestr(f"{name}.xlsx", xb)
+            st.download_button("📥 ZIP 받기", zip_buffer.getvalue(), "Cost_Set.zip", "application/zip")

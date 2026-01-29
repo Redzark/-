@@ -9,7 +9,7 @@ from copy import copy
 from openpyxl.styles import Alignment, Font, Border, Side, PatternFill
 
 # ============================================================================
-# 1. 기초 데이터 및 설정 (사장님 기준 절대 유지)
+# 1. 기초 데이터 및 설정 (사장님 기준 절대 사수)
 # ============================================================================
 MAT_START_ROW = 12
 MAT_STEP = 4
@@ -30,7 +30,7 @@ MATERIAL_DATA = {
 DRY_CYCLE_MAP = {50:10, 70:11, 100:12, 120:13, 150:14, 170:14, 220:15, 280:16, 350:19, 450:21, 500:21, 550:21, 600:22, 650:22, 700:23, 750:23, 850:26, 900:26, 1050:26, 1300:28, 1600:30, 1800:31, 2000:32, 2200:36, 2300:37, 2400:37, 2500:38, 3000:44}
 
 # ============================================================================
-# 2. 로직 함수
+# 2. 로직 함수 (안전장치)
 # ============================================================================
 def safe_float(value, default=0.0):
     try:
@@ -113,7 +113,7 @@ def safe_write(ws, coord, value):
     except Exception: pass
 
 # ============================================================================
-# 3. PART LIST 파싱 함수 (Lv.1 자동 분할 로직 적용)
+# 3. PART LIST 파싱 함수 (개선됨: Qt'y 인식 & Lv.1 기준 자동 분할)
 # ============================================================================
 def extract_header_info(ws):
     extracted = {"car": "", "vol": 0}
@@ -138,9 +138,10 @@ def parse_part_list_matrix(file):
         all_rows = list(ws.iter_rows(values_only=True))
         
         header_row_index = -1
-        # Lv 컬럼 추가 찾기
-        col_map = {'lv': 1, 'part_no': 7, 'name': 8, 'qty_cols': [], 'mat': 22, 'ton': 23, 'cav': 24, 'L':10, 'W':11, 'H':12} 
+        # Lv 컬럼 범위 추정을 위해 lv_start 추가
+        col_map = {'lv_start': 1, 'part_no': 7, 'name': 8, 'qty_cols': [], 'mat': 22, 'ton': 23, 'cav': 24, 'L':10, 'W':11, 'H':12} 
         
+        # 헤더 찾기
         for i, r in enumerate(all_rows):
             row_str = " ".join([str(x) for x in r if x]).replace(" ", "").upper()
             if "PARTNO" in row_str or "품번" in row_str:
@@ -148,10 +149,13 @@ def parse_part_list_matrix(file):
                 row1 = r
                 row2 = all_rows[i+1] if i+1 < len(all_rows) else [None]*len(r)
                 
+                # 윗줄 분석
                 for idx, cell in enumerate(row1):
                     if not cell: continue
-                    c_val = str(cell).upper().replace(" ", "").replace("\n", "")
-                    if "LV" == c_val or "LEVEL" in c_val or "레벨" in c_val: col_map['lv'] = idx
+                    # [핵심] 특수문자(') 제거하여 Qt'y -> QTY로 인식하게 만듦
+                    c_val = str(cell).upper().replace(" ", "").replace("\n", "").replace("'", "")
+                    
+                    if "LV" == c_val or "LEVEL" in c_val or "레벨" in c_val: col_map['lv_start'] = idx
                     elif "PARTNO" in c_val or "품번" in c_val: col_map['part_no'] = idx
                     elif "PARTNAME" in c_val or "품명" in c_val: col_map['name'] = idx
                     elif "MATERIAL" in c_val or "재질" in c_val: col_map['mat'] = idx
@@ -160,9 +164,11 @@ def parse_part_list_matrix(file):
                     if "QTY" in c_val or "수량" in c_val or "USG" in c_val:
                         if idx not in col_map['qty_cols']: col_map['qty_cols'].append(idx)
                             
+                # 아랫줄 분석
                 for idx, cell in enumerate(row2):
                     if not cell: continue
-                    c_val = str(cell).upper().replace(" ", "").replace("\n", "")
+                    c_val = str(cell).upper().replace(" ", "").replace("\n", "").replace("'", "")
+                    
                     if "가로" in c_val or "L" == c_val or "LENGTH" in c_val: col_map['L'] = idx
                     elif "세로" in c_val or "W" == c_val or "WIDTH" in c_val: col_map['W'] = idx
                     elif "깊이" in c_val or "높이" in c_val or "H" == c_val: col_map['H'] = idx
@@ -176,123 +182,125 @@ def parse_part_list_matrix(file):
 
         if header_row_index == -1: header_row_index = 5 
 
-        # [핵심 로직] 기둥(Column)별로 ASSY가 바뀔 때마다 쪼개기
+        # [핵심 로직] 각 Qty 기둥(Column)별로 -> 위에서 아래로 읽으며 -> Lv.1이 바뀔 때마다 그룹핑
         assy_dict = {} 
         
-        # 각 기둥별로 현재 대장(Root Parent)을 기억하기 위한 맵
-        # current_root_map = { column_index: "Current_ASSY_Name" }
-        current_root_map = {} 
+        # Lv 열 범위: 'Lv' 헤더부터 'Part No' 헤더 직전까지
+        lv_start = col_map.get('lv_start', 1)
+        lv_end = col_map.get('part_no', 7)
 
-        for i in range(header_row_index + 1, len(all_rows)):
-            r = list(all_rows[i])
-            if len(r) < 100: r.extend([None] * (100 - len(r)))
+        for q_col in col_map['qty_cols']:
             
-            # 1. 이 줄이 Lv.1(●) 인지 확인
-            lv_val = str(r[col_map.get('lv', 1)]).strip()
-            is_root = False
-            if "●" in lv_val or "1" == lv_val: 
-                is_root = True
+            current_root_name = None
             
-            # 2. 각 수량 기둥(Column)을 순회하며 확인
-            for q_col in col_map['qty_cols']:
+            for i in range(header_row_index + 1, len(all_rows)):
+                r = list(all_rows[i])
+                if len(r) < 100: r.extend([None] * (100 - len(r)))
+                
+                # 1. 수량 확인
                 u_val_raw = safe_float(r[q_col])
                 
-                # 수량이 있는 경우만 처리
-                if u_val_raw > 0:
+                # 2. Level 확인 (Lv 영역 내에 '●'나 '1'이 있는지)
+                # Left-most mark is Level 1.
+                this_level = 999
+                for l_idx in range(lv_start, lv_end):
+                    val = str(r[l_idx]).strip()
+                    if "●" in val or "1" == val:
+                        this_level = l_idx - lv_start + 1 # 1부터 시작
+                        break
+                
+                is_root = (this_level == 1)
+
+                # 3. 새로운 Root ASSY 시작 감지 (이 기둥에서 유효한 놈이어야 함)
+                if is_root and u_val_raw > 0:
+                    p_idx = col_map.get('part_no', 7)
+                    n_idx = col_map.get('name', 8)
+                    raw_no = str(r[p_idx]).strip() if r[p_idx] else ""
+                    raw_name = str(r[n_idx]).strip() if r[n_idx] else f"ASSY_{uuid.uuid4().hex[:4]}"
                     
-                    # 2-1. Root(●)가 나오면, 이 기둥의 새로운 대장으로 등록
-                    if is_root:
-                        p_idx = col_map.get('part_no', 7)
-                        n_idx = col_map.get('name', 8)
-                        
-                        raw_no = str(r[p_idx]).strip() if r[p_idx] else ""
-                        raw_name = str(r[n_idx]).strip() if r[n_idx] else f"ASSY_{uuid.uuid4().hex[:4]}"
-                        
-                        # 품번이 없으면 품명(NAME)을 파일명으로 사용 ("ASSY 품번 필요" 대비)
-                        if not raw_no or "ASSY" in raw_no or "필요" in raw_no:
-                            base_name = raw_name.replace("/", "_").replace("*", "")[:20]
-                        else:
-                            base_name = raw_no.replace("/", "_").replace("*", "")
-
-                        # 유니크한 키 생성 (파일명 중복 방지: 품번_열번호)
-                        root_key = f"{base_name}_Type{q_col}"
-                        current_root_map[q_col] = root_key
-                        
-                        # 새 그룹 시작
-                        if root_key not in assy_dict:
-                            assy_dict[root_key] = []
-
-                    # 2-2. 현재 대장(Root)이 정해져 있다면, 이 부품을 거기에 추가
-                    if q_col in current_root_map:
-                        root_key = current_root_map[q_col]
-                        
-                        # 부품 정보 파싱 (기존 로직)
-                        p_idx = col_map.get('part_no', 7)
-                        if not r[p_idx]: continue # 품번 없으면 스킵
-                        p_no_str = str(r[p_idx]).strip()
-                        clean_p_no = p_no_str.replace(" ", "").upper()
-                        if "PARTNO" in clean_p_no or "품번" in clean_p_no: continue
-                        
-                        # 사출품 판단
+                    if not raw_no or "ASSY" in raw_no or "필요" in raw_no:
+                        base_name = raw_name.replace("/", "_").replace("*", "")[:25]
+                    else:
+                        base_name = raw_no.replace("/", "_").replace("*", "")
+                    
+                    # 키 생성 (ASSY명)
+                    current_root_name = base_name
+                    if current_root_name not in assy_dict:
+                        assy_dict[current_root_name] = []
+                
+                # 4. Root가 아닐 경우(또는 수량 없는 Root일 경우) 처리
+                if current_root_name:
+                    if u_val_raw > 0:
+                        # 사출품인지 확인
                         t_idx = col_map.get('ton', 28)
                         m_idx = col_map.get('mat', 27) 
                         raw_ton = r[t_idx] if t_idx < len(r) else None
                         raw_mat = r[m_idx] if m_idx < len(r) else None
                         
-                        if not safe_float(raw_ton) and (not raw_mat or str(raw_mat).strip() == ""):
-                            # 사출품 아니어도, Root(Lv.1) 자신이면 리스트에 넣을지 말지?
-                            # 사장님은 '원가계산서'를 원하므로 사출품만 넣는게 맞음.
-                            # 단, Root 본인이 사출품이 아니면(조립품이면) 스킵.
-                            continue
+                        # Root 자신은 리스트에 넣지 않음 (보통 Assembly Row이므로)
+                        # 단, Root가 사출품이면(단품이 ASSY인 경우) 넣어야 함.
+                        if safe_float(raw_ton) or (raw_mat and str(raw_mat).strip()):
+                            # 데이터 추출
+                            p_idx = col_map.get('part_no', 7)
+                            n_idx = col_map.get('name', 8)
+                            p_no_str = str(r[p_idx]).strip() if r[p_idx] else ""
+                            p_name = str(r[n_idx]).strip() if r[n_idx] else ""
+                            
+                            l = safe_float(r[col_map.get('L', 13)])
+                            w = safe_float(r[col_map.get('W', 14)])
+                            h = safe_float(r[col_map.get('H', 15)])
+                            t_col = col_map.get('thick')
+                            t = safe_float(r[t_col]) if t_col and t_col < len(r) else 2.5
+                            if t == 0: t = 2.5
+                            w_col = col_map.get('weight')
+                            weight_val = safe_float(r[w_col]) if w_col and w_col < len(r) else 0.0
 
-                        # 데이터 추출
-                        n_idx = col_map.get('name', 8)
-                        rem_val = str(r[n_idx + 1] if n_idx + 1 < len(r) and r[n_idx+1] else "")
-                        p_name = str(r[n_idx]).strip() if n_idx < len(r) and r[n_idx] else ""
-                        
-                        l = safe_float(r[col_map.get('L', 13)])
-                        w = safe_float(r[col_map.get('W', 14)])
-                        h = safe_float(r[col_map.get('H', 15)])
-                        t_col = col_map.get('thick')
-                        t = safe_float(r[t_col]) if t_col and t_col < len(r) else 2.5
-                        if t == 0: t = 2.5
-                        w_col = col_map.get('weight')
-                        weight_val = safe_float(r[w_col]) if w_col and w_col < len(r) else 0.0
+                            mapped_mat = "무도장 TPO"
+                            if raw_mat:
+                                s_mat = str(raw_mat).upper()
+                                for key in MATERIAL_DATA.keys():
+                                    if key in s_mat: mapped_mat = key; break
+                                if "PP" in s_mat and mapped_mat == "무도장 TPO": mapped_mat = "PP"
 
-                        mapped_mat = "무도장 TPO"
-                        if raw_mat:
-                            s_mat = str(raw_mat).upper()
-                            for key in MATERIAL_DATA.keys():
-                                if key in s_mat: mapped_mat = key; break
-                            if "PP" in s_mat and mapped_mat == "무도장 TPO": mapped_mat = "PP"
+                            ton = int(safe_float(raw_ton, default=1300))
+                            
+                            cv_idx = col_map.get('cav', t_idx + 1)
+                            raw_cav = str(r[cv_idx]) if cv_idx < len(r) else "1"
+                            if "/" in raw_cav:
+                                try: cav = int(sum(safe_float(x) for x in raw_cav.split('/') if x.strip()))
+                                except: cav = int(safe_float(raw_cav, default=1))
+                            else:
+                                cav = int(safe_float(raw_cav, default=1))
+                            if cav < 1: cav = 1
 
-                        ton = int(safe_float(raw_ton, default=1300))
-                        
-                        cv_idx = col_map.get('cav', t_idx + 1)
-                        raw_cav = str(r[cv_idx]) if cv_idx < len(r) else "1"
-                        if "/" in raw_cav:
-                            try: cav = int(sum(safe_float(x) for x in raw_cav.split('/') if x.strip()))
-                            except: cav = int(safe_float(raw_cav, default=1))
-                        else:
-                            cav = int(safe_float(raw_cav, default=1))
-                        if cav < 1: cav = 1
-
-                        item = {
-                            "id": str(uuid.uuid4()),
-                            "level": "사출제품",
-                            "no": p_no_str,
-                            "name": p_name,
-                            "remarks": rem_val,
-                            "opt_rate": 100.0,
-                            "usage": u_val_raw, 
-                            "L": l, "W": w, "H": h, "thick": t,
-                            "weight": weight_val,
-                            "mat": mapped_mat,
-                            "ton": ton,
-                            "cavity": cav,
-                            "price": 2000
-                        }
-                        assy_dict[root_key].append(item)
+                            item = {
+                                "id": str(uuid.uuid4()),
+                                "level": "사출제품",
+                                "no": p_no_str,
+                                "name": p_name,
+                                "remarks": str(r[n_idx + 1] if n_idx + 1 < len(r) and r[n_idx+1] else ""),
+                                "opt_rate": 100.0,
+                                "usage": u_val_raw, 
+                                "L": l, "W": w, "H": h, "thick": t,
+                                "weight": weight_val,
+                                "mat": mapped_mat,
+                                "ton": ton,
+                                "cavity": cav,
+                                "price": 2000
+                            }
+                            
+                            # 중복 방지 (완전히 동일한 객체만)
+                            is_dup = False
+                            for existing in assy_dict[current_root_name]:
+                                if existing['no'] == item['no'] and existing['name'] == item['name']:
+                                    is_dup = True
+                                    break
+                            if not is_dup:
+                                assy_dict[current_root_name].append(item)
+                
+                # Lv.1인데 수량이 0이다? -> 이 기둥에서는 이 ASSY 안 씀 -> Current Root 해제
+                if is_root and u_val_raw <= 0:
+                    current_root_name = None
 
         # 빈 그룹 제거
         final_dict = {k: v for k, v in assy_dict.items() if v}
@@ -304,7 +312,7 @@ def parse_part_list_matrix(file):
         return {}, {}
 
 # ============================================================================
-# 4. 엑셀 생성 함수 (수직 이어붙이기)
+# 4. 엑셀 생성 함수 (수정됨: cell() 함수 에러 해결)
 # ============================================================================
 def copy_template_style(src_ws, tgt_ws, start_row, max_row):
     for row in range(1, max_row + 1):
@@ -334,15 +342,41 @@ def generate_excel_file_stacked(common, items, sel_year):
         template_ws = wb.active 
     except: return None
 
-    ws_main = wb.create_sheet("Calculation_Total", 0)
+    # [NEW] 집계표 시트
+    ws_summary = wb.create_sheet("ASSY_Summary", 0)
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="36486b", end_color="36486b", fill_type="solid")
+    align_center = Alignment(horizontal='center', vertical='center')
+    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+
+    headers = ["NO", "PART NO", "PART NAME", "USAGE", "MATERIAL", "TON", "CAVITY", "WEIGHT(g)", "NOTE"]
+    for col_idx, h_text in enumerate(headers, 1):
+        cell = ws_summary.cell(row=1, column=col_idx, value=h_text)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = align_center
+        cell.border = thin_border
+    
+    for idx, item in enumerate(items, 1):
+        row_num = idx + 1
+        data = [idx, item['no'], item['name'], item['usage'], item['mat'], item['ton'], item['cavity'], item['weight'], item['remarks']]
+        for col_idx, val in enumerate(data, 1):
+            cell = ws_summary.cell(row=row_num, column=col_idx, value=val)
+            cell.alignment = align_center
+            cell.border = thin_border
+    ws_summary.column_dimensions['B'].width = 25
+    ws_summary.column_dimensions['C'].width = 35
+
+    # [NEW] 상세 시트 (이어붙이기)
+    ws_main = wb.create_sheet("Calculation_Total", 1)
     template_max_row = template_ws.max_row
     current_offset = 1 
-    align_center = Alignment(horizontal='center', vertical='center')
 
     for item in items:
         copy_template_style(template_ws, ws_main, current_offset, template_max_row)
         
-        def cell(r, c): 
+        # [수정 완료] 인자 1개로 받도록 수정
+        def cell(r): 
             col = openpyxl.utils.cell.coordinate_from_string(r)[0]
             row = openpyxl.utils.cell.coordinate_from_string(r)[1]
             return f"{col}{row + current_offset - 1}"
@@ -479,7 +513,7 @@ if mode in ["단품 계산", "ASSY(수동 입력)"]:
             item['cavity'] = r2[2].number_input("Cav", min_value=1, value=int(item['cavity']), key=f"ca_{uid}")
             item['price'] = st.number_input("단가(참고용)", value=item['price'], key=f"pr_{uid}")
 
-    if st.button("엑셀 생성 (Single File)", type="primary"):
+    if st.button("엑셀 생성", type="primary"):
         excel_bytes = generate_excel_file_stacked({"car":car, "base_vol":base_vol}, st.session_state.manual_items, 2026)
         if excel_bytes: st.download_button("📥 다운로드", excel_bytes, "Manual_Cost.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -493,7 +527,7 @@ else:
                 st.session_state.assy_dict = assy_data
                 st.session_state.common_car = info.get('car', '')
                 st.session_state.common_vol = info.get('vol', 0)
-                st.success(f"✅ {len(assy_data)}개 ASSY(Lv.1 기준) 분리 완료!")
+                st.success(f"✅ {len(assy_data)}개 ASSY 분리 완료!")
             else: st.error("데이터 없음 (톤수/재질 확인)")
 
     if st.session_state.assy_dict:

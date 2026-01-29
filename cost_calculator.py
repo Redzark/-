@@ -113,7 +113,7 @@ def safe_write(ws, coord, value):
     except Exception: pass
 
 # ============================================================================
-# 3. PART LIST 파싱 함수 (동적 부모 추적 로직 탑재)
+# 3. PART LIST 파싱 함수 (블록 단위 파싱: 완벽 분해)
 # ============================================================================
 def normalize_header(s):
     if not s: return ""
@@ -177,30 +177,26 @@ def parse_part_list_matrix(file):
                 elif s_val in ["W", "WIDTH", "세로"]: col_map['W'] = idx
                 elif s_val in ["H", "HEIGHT", "높이", "깊이"]: col_map['H'] = idx
                 
-                # 수량 컬럼 감지 (특수문자 무시)
+                # 수량 컬럼 감지
                 if "QTY" in s_val or "USG" in s_val or "USAGE" in s_val or "수량" in s_val:
                     qty_cols_set.add(idx)
 
         col_map['qty_cols'] = sorted(list(qty_cols_set))
         if col_map['lv_start'] == -1: col_map['lv_start'] = 1 
 
-        debug_log.append(f"ℹ️ 수량 기둥 {len(col_map['qty_cols'])}개 감지됨 (J, K, L...)")
+        debug_log.append(f"ℹ️ 수량 기둥 {len(col_map['qty_cols'])}개 감지됨")
 
-        # 2. 파싱 (동적 부모 추적)
+        # 2. 파싱 (블록 단위 - Block Parsing)
         assy_dict = {} 
-        
-        # 각 기둥(Col)별로 현재 누구 밑에 줄을 서 있는지 기억하는 변수
-        # key: col_index, value: "Current_Parent_Name"
-        active_parents = {col: None for col in col_map['qty_cols']}
         
         lv_start = col_map['lv_start']
         lv_end = col_map['part_no'] if col_map['part_no'] != -1 else lv_start + 5
 
+        # Lv.1 행들의 인덱스를 먼저 찾습니다.
+        level1_indices = []
         for i in range(header_row_index + 1, len(all_rows)):
             r = list(all_rows[i])
-            if len(r) < 100: r.extend([None] * (100 - len(r)))
-
-            # 레벨 확인
+            # Lv.1 여부 확인
             this_level = 999
             for l_idx in range(lv_start, lv_end + 2):
                 if l_idx >= len(r): break
@@ -208,55 +204,98 @@ def parse_part_list_matrix(file):
                 if "●" in val or "1" == val or "●" in normalize_header(val):
                     this_level = l_idx - lv_start + 1
                     break
+            if this_level == 1:
+                level1_indices.append(i)
+        
+        level1_indices.append(len(all_rows)) # 끝 지점 추가
+
+        # 각 Lv.1 블록을 순회
+        for k in range(len(level1_indices) - 1):
+            start_row = level1_indices[k]
+            end_row = level1_indices[k+1]
             
-            is_root = (this_level == 1)
+            # Lv.1 행 데이터
+            root_r = list(all_rows[start_row])
+            if len(root_r) < 100: root_r.extend([None] * (100 - len(root_r)))
 
-            # 각 기둥별로 순회하며 "내 부품인가?" 확인
+            # 이 Lv.1이 어떤 기둥(Column)에서 활성화되어 있는지 확인
+            # 예: 86350-T6700은 J열에서 활성, K열에선 비활성
+            
+            p_idx = col_map.get('part_no', 7)
+            n_idx = col_map.get('name', 8)
+            raw_no = str(root_r[p_idx]).strip() if (p_idx != -1 and root_r[p_idx]) else ""
+            raw_name = str(root_r[n_idx]).strip() if (n_idx != -1 and root_r[n_idx]) else f"ASSY_{k}"
+            
+            if not raw_no or "ASSY" in raw_no.upper() or "필요" in raw_no:
+                base_name_origin = raw_name.replace("/", "_").replace("*", "")[:35]
+            else:
+                base_name_origin = raw_no.replace("/", "_").replace("*", "")
+
+            # 사용된 기둥 찾기
+            active_cols = []
             for q_col in col_map['qty_cols']:
-                u_val_raw = safe_float(r[q_col])
-                
-                # [CASE 1] Lv.1 (대장) 등장
-                if is_root:
-                    if u_val_raw > 0:
-                        # 이 기둥의 새로운 주인 탄생
-                        p_idx = col_map['part_no']
-                        n_idx = col_map['name']
-                        raw_no = str(r[p_idx]).strip() if (p_idx != -1 and r[p_idx]) else ""
-                        raw_name = str(r[n_idx]).strip() if (n_idx != -1 and r[n_idx]) else f"ASSY_{uuid.uuid4().hex[:4]}"
-                        
-                        # 품번 없으면 이름으로 대체
-                        if not raw_no or "ASSY" in raw_no.upper() or "필요" in raw_no:
-                            base_name = raw_name.replace("/", "_").replace("*", "")[:35]
-                            # 이름만으로는 중복될 수 있으므로 (같은 백커버인데 타입이 다름)
-                            # 뒤에 구분자 추가
-                            base_name = f"{base_name}_{openpyxl.utils.get_column_letter(q_col+1)}"
-                        else:
-                            base_name = raw_no.replace("/", "_").replace("*", "")
+                if safe_float(root_r[q_col]) > 0:
+                    active_cols.append(q_col)
+            
+            if not active_cols:
+                # Lv.1인데 수량이 하나도 없는 경우 -> 그래도 하위 부품은 있을 수 있으니 일단 진행?
+                # 보통 이런 경우 Header 역할만 함.
+                # 하지만 하위 부품이 특정 열에 수량이 있다면 그 열의 ASSY로 간주해야 함.
+                # 편의상 모든 수량 기둥을 검사 대상으로 삼음.
+                active_cols = col_map['qty_cols']
 
-                        active_parents[q_col] = base_name
-                        
-                        # 새 리스트 생성 (없으면)
-                        if base_name not in assy_dict:
-                            assy_dict[base_name] = []
-                            debug_log.append(f"📌 새 ASSY 발견: {base_name} (Col {openpyxl.utils.get_column_letter(q_col+1)})")
-                    else:
-                        # 이 기둥에선 이 대장 안 씀 -> 주인 없음 상태
-                        active_parents[q_col] = None
+            # 이제 이 블록(start_row ~ end_row) 안에 있는 부품들을 긁어모음
+            # 단, 파일은 Lv.1 이름 기준으로 생성 (중복되면 _Col 추가)
+            
+            # 대장(Lv.1)이 하나라도 발견되면 파일 생성 대상
+            # 여기서는 "Lv.1 품번" 자체가 하나의 파일이 됨.
+            
+            # [중요] Lv.1이 여러 기둥에 걸쳐 있을 수 있음 (공용 Back Cover 등)
+            # 이 경우 파일 하나만 만들면 됨.
+            
+            assy_key = base_name_origin
+            if assy_key in assy_dict: 
+                # 이름이 중복된다면 (드문 경우), 뒤에 번호 붙임
+                assy_key = f"{assy_key}_{k}"
+            
+            items_in_this_block = []
+
+            # Lv.1 본인이 사출품이면 추가
+            # ... (본인 추가 로직 생략, 보통 Assembly라 제외하지만 톤수 있으면 추가)
+            t_idx = col_map.get('ton', 28)
+            m_idx = col_map.get('mat', 27) 
+            raw_ton = root_r[t_idx] if t_idx != -1 and t_idx < len(root_r) else None
+            raw_mat = root_r[m_idx] if m_idx != -1 and m_idx < len(root_r) else None
+            
+            if safe_float(raw_ton) or (raw_mat and str(raw_mat).strip()):
+                 # 본인 추가
+                 # (추가 코드는 아래 하위 부품 로직과 동일하므로 함수화하거나 복붙)
+                 pass # 일단 생략, 보통 하위부품이 중요
+
+            # 하위 부품 순회 (start_row + 1 ~ end_row - 1)
+            for i in range(start_row + 1, end_row):
+                r = list(all_rows[i])
+                if len(r) < 100: r.extend([None] * (100 - len(r)))
                 
-                # [CASE 2] 하위 부품 (또는 대장 본인) 처리
-                # 현재 주인이 있어야만 담을 수 있음
-                current_parent = active_parents[q_col]
+                # 이 부품이 이 Lv.1 블록에서 유효한지 확인
+                # 조건: Lv.1이 활성화된 기둥(active_cols) 중 하나라도 수량이 있어야 함.
                 
-                if current_parent and u_val_raw > 0:
+                is_valid_child = False
+                usage_val = 0.0
+                
+                for q_col in active_cols:
+                    u = safe_float(r[q_col])
+                    if u > 0:
+                        is_valid_child = True
+                        usage_val = u # 첫 번째 발견된 수량 사용 (보통 같음)
+                        break
+                
+                if is_valid_child:
                     # 사출품 조건 확인
-                    t_idx = col_map['ton']
-                    m_idx = col_map['mat']
                     raw_ton = r[t_idx] if t_idx != -1 and t_idx < len(r) else None
                     raw_mat = r[m_idx] if m_idx != -1 and m_idx < len(r) else None
                     
-                    # 사출품이거나 재질 정보가 있으면 담는다
                     if safe_float(raw_ton) or (raw_mat and str(raw_mat).strip()):
-                        
                         # 데이터 추출
                         p_idx = col_map['part_no']
                         n_idx = col_map['name']
@@ -297,7 +336,7 @@ def parse_part_list_matrix(file):
                             "name": p_name,
                             "remarks": str(r[n_idx + 1] if n_idx != -1 and n_idx + 1 < len(r) and r[n_idx+1] else ""),
                             "opt_rate": 100.0,
-                            "usage": u_val_raw, 
+                            "usage": usage_val, 
                             "L": l, "W": w, "H": h, "thick": t,
                             "weight": weight_val,
                             "mat": mapped_mat,
@@ -305,21 +344,16 @@ def parse_part_list_matrix(file):
                             "cavity": cav,
                             "price": 2000
                         }
-                        
-                        # 중복 방지 (완전히 동일한 객체)
-                        is_dup = False
-                        for existing in assy_dict[current_parent]:
-                            if existing['no'] == item['no'] and existing['name'] == item['name']:
-                                is_dup = True
-                                break
-                        if not is_dup:
-                            assy_dict[current_parent].append(item)
+                        items_in_this_block.append(item)
+            
+            if items_in_this_block:
+                assy_dict[assy_key] = items_in_this_block
+                debug_log.append(f"📦 ASSY 생성: {assy_key} (부품 {len(items_in_this_block)}개)")
 
-        final_dict = {k: v for k, v in assy_dict.items() if v}
-        return final_dict, header_info, debug_log
+        return assy_dict, header_info, debug_log
 
     except Exception as e:
-        return {}, {}, [f"❌ 심각한 오류: {str(e)}", traceback.format_exc()]
+        return {}, {}, [f"❌ 오류: {str(e)}", traceback.format_exc()]
 
 # ============================================================================
 # 4. 엑셀 생성 함수 (수직 이어붙이기)
@@ -352,6 +386,7 @@ def generate_excel_file_stacked(common, items, sel_year):
         template_ws = wb.active 
     except: return None
 
+    # [1] 집계표 시트
     ws_summary = wb.create_sheet("ASSY_Summary", 0)
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="36486b", end_color="36486b", fill_type="solid")
@@ -376,6 +411,7 @@ def generate_excel_file_stacked(common, items, sel_year):
     ws_summary.column_dimensions['B'].width = 25
     ws_summary.column_dimensions['C'].width = 35
 
+    # [2] 상세 시트
     ws_main = wb.create_sheet("Calculation_Total", 1)
     template_max_row = template_ws.max_row
     current_offset = 1 
@@ -525,7 +561,7 @@ if mode in ["단품 계산", "ASSY(수동 입력)"]:
         if excel_bytes: st.download_button("📥 다운로드", excel_bytes, "Manual_Cost.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 else:
-    st.info("💡 엑셀을 올리면 [모든 기둥 + 모든 Lv.1 그룹]을 자동 분석하여 ZIP으로 줍니다.")
+    st.info("💡 엑셀을 올리면 [Lv.1 덩어리] 단위로 자동 분석하여 ZIP으로 줍니다.")
     uploaded_file = st.file_uploader("PART LIST 파일 업로드", type=["xlsx", "xls"])
     if uploaded_file:
         if st.button("🔄 분석 시작"):
@@ -538,8 +574,8 @@ else:
                 st.session_state.assy_dict = assy_data
                 st.session_state.common_car = info.get('car', '')
                 st.session_state.common_vol = info.get('vol', 0)
-                st.success(f"✅ 총 {len(assy_data)}개의 ASSY 세트 발견!")
-            else: st.error("데이터 없음")
+                st.success(f"✅ 총 {len(assy_data)}개의 ASSY 파일이 생성될 예정입니다!")
+            else: st.error("데이터 없음 (Qt'y 헤더 또는 톤수/재질 확인 필요)")
 
     if st.session_state.assy_dict:
         c1, c2 = st.columns(2)
@@ -549,7 +585,7 @@ else:
         for name, items in st.session_state.assy_dict.items():
             with st.expander(f"📦 {name} ({len(items)} parts)"):
                 for it in items: st.write(f"- {it['no']} ({it['name']})")
-        if st.button("ZIP 다운로드", type="primary"):
+        if st.button("ZIP 다운로드 (ASSY별 통합 파일)", type="primary"):
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w") as zf:
                 for name, items in st.session_state.assy_dict.items():

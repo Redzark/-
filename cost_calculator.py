@@ -5,7 +5,7 @@ import uuid
 import re
 import traceback
 import zipfile
-from openpyxl.styles import Alignment
+from openpyxl.styles import Alignment, Font, Border, Side, PatternFill
 
 # ============================================================================
 # 1. 기초 데이터 및 설정 (사장님 기준 절대 유지)
@@ -28,7 +28,7 @@ MATERIAL_DATA = {
 DRY_CYCLE_MAP = {50:10, 70:11, 100:12, 120:13, 150:14, 170:14, 220:15, 280:16, 350:19, 450:21, 500:21, 550:21, 600:22, 650:22, 700:23, 750:23, 850:26, 900:26, 1050:26, 1300:28, 1600:30, 1800:31, 2000:32, 2200:36, 2300:37, 2400:37, 2500:38, 3000:44}
 
 # ============================================================================
-# 2. 로직 함수 (안전장치 & 계산식 절대 유지)
+# 2. 로직 함수 (1/1=1, 1/1=2 유지, A3 보존, 100칸 패딩)
 # ============================================================================
 def safe_float(value, default=0.0):
     try:
@@ -111,7 +111,7 @@ def safe_write(ws, coord, value):
     except Exception: pass
 
 # ============================================================================
-# 3. PART LIST 파싱 함수 (Matrix 대응 & 헤더 추출)
+# 3. PART LIST 파싱 함수 (매트릭스 구조 자동 분해)
 # ============================================================================
 def extract_header_info(ws):
     extracted = {"car": "", "vol": 0}
@@ -136,8 +136,10 @@ def parse_part_list_matrix(file):
         all_rows = list(ws.iter_rows(values_only=True))
         
         header_row_index = -1
+        # 컬럼 매핑 초기화
         col_map = {'part_no': 7, 'name': 8, 'qty_cols': [], 'mat': 22, 'ton': 23, 'cav': 24, 'L':10, 'W':11, 'H':12} 
         
+        # 헤더 찾기
         for i, r in enumerate(all_rows):
             row_str = " ".join([str(x) for x in r if x]).replace(" ", "").upper()
             if "PARTNO" in row_str or "품번" in row_str:
@@ -145,6 +147,7 @@ def parse_part_list_matrix(file):
                 row1 = r
                 row2 = all_rows[i+1] if i+1 < len(all_rows) else [None]*len(r)
                 
+                # Qty(수량) 컬럼이 어디어디 있는지 몽땅 찾음 (J열, K열, L열...)
                 for idx, cell in enumerate(row1):
                     if not cell: continue
                     c_val = str(cell).upper().replace(" ", "").replace("\n", "")
@@ -172,22 +175,29 @@ def parse_part_list_matrix(file):
 
         if header_row_index == -1: header_row_index = 5 
 
+        # [핵심] 기둥(Column)별로 쪼개기
         assy_dict = {} 
+        
         for q_col in col_map['qty_cols']:
+            # 1. 이 기둥의 주인(ASSY 품번) 찾기
+            # 해당 열에서 가장 위에 있는 '1'을 가진 품목이 대장(ASSY)이라고 가정
             assy_name = f"ASSY_Type_{q_col}" 
             for i in range(header_row_index + 1, len(all_rows)):
                 r = list(all_rows[i])
                 if len(r) > q_col and safe_float(r[q_col]) > 0:
                     temp_no = str(r[col_map['part_no']]).strip()
                     if temp_no and "None" not in temp_no:
+                        # 파일명으로 쓸 거니까 특수문자 제거
                         assy_name = temp_no.replace("/", "_").replace("*", "")
                         break
             
+            # 2. 이 기둥에 속한(1이 찍힌) 부품들 싹 긁어모으기
             items_in_assy = []
             for i in range(header_row_index + 1, len(all_rows)):
                 r = list(all_rows[i])
-                if len(r) < 100: r.extend([None] * (100 - len(r)))
+                if len(r) < 100: r.extend([None] * (100 - len(r))) # 100칸 패딩 (안전장치)
                 
+                # 이 기둥(q_col)에 숫자가 없으면 내 부품 아님 -> 패스
                 u_val_raw = safe_float(r[q_col]) 
                 if u_val_raw <= 0: continue
 
@@ -198,9 +208,7 @@ def parse_part_list_matrix(file):
                 if "PARTNO" in clean_p_no or "품번" in clean_p_no: continue
                 if "비고" in clean_p_no or "REMARK" in clean_p_no: continue
                 
-                n_idx = col_map.get('name', 8)
-                rem_val = str(r[n_idx + 1] if n_idx + 1 < len(r) and r[n_idx+1] else "")
-                
+                # 사출품인지 확인 (톤수/재질)
                 t_idx = col_map.get('ton', 28)
                 m_idx = col_map.get('mat', 27) 
                 raw_ton = r[t_idx] if t_idx < len(r) else None
@@ -209,7 +217,11 @@ def parse_part_list_matrix(file):
                 if not safe_float(raw_ton) and (not raw_mat or str(raw_mat).strip() == ""):
                     continue
 
+                # 데이터 추출
+                n_idx = col_map.get('name', 8)
+                rem_val = str(r[n_idx + 1] if n_idx + 1 < len(r) and r[n_idx+1] else "")
                 p_name = str(r[n_idx]).strip() if n_idx < len(r) and r[n_idx] else ""
+                
                 l = safe_float(r[col_map.get('L', 13)])
                 w = safe_float(r[col_map.get('W', 14)])
                 h = safe_float(r[col_map.get('H', 15)])
@@ -228,6 +240,7 @@ def parse_part_list_matrix(file):
 
                 ton = int(safe_float(raw_ton, default=1300))
                 
+                # Cavity 1/1 -> 2
                 cv_idx = col_map.get('cav', t_idx + 1)
                 raw_cav = str(r[cv_idx]) if cv_idx < len(r) else "1"
                 if "/" in raw_cav:
@@ -254,6 +267,7 @@ def parse_part_list_matrix(file):
                 }
                 items_in_assy.append(item)
             
+            # 3. 결과 저장 (ASSY 이름 : 부품 리스트)
             if items_in_assy:
                 if assy_name in assy_dict: assy_name = f"{assy_name}_{q_col}"
                 assy_dict[assy_name] = items_in_assy
@@ -266,7 +280,7 @@ def parse_part_list_matrix(file):
         return {}, {}
 
 # ============================================================================
-# 4. 엑셀 생성 함수 (수동용 & 매트릭스용 공용)
+# 4. 엑셀 생성 함수 (집계표 + 상세시트 포함한 '통합 엑셀' 생성)
 # ============================================================================
 def generate_excel_file(common, items, sel_year):
     try:
@@ -275,10 +289,35 @@ def generate_excel_file(common, items, sel_year):
         template_sheet.title = "Master_Template"
     except: return None
 
+    # [1] 집계표(Summary) 시트 생성 (맨 앞장)
+    ws_summary = wb.create_sheet("ASSY_Summary", 0)
+    
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="36486b", end_color="36486b", fill_type="solid")
     align_center = Alignment(horizontal='center', vertical='center')
+    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
 
-    # 단품/수동 모드에서는 items가 리스트이므로 바로 순회
-    # 파일 하나에 모든 부품을 시트로 만듦 (기존 로직)
+    headers = ["NO", "PART NO", "PART NAME", "USAGE", "MATERIAL", "TON", "CAVITY", "WEIGHT(g)", "NOTE"]
+    for col_idx, h_text in enumerate(headers, 1):
+        cell = ws_summary.cell(row=1, column=col_idx, value=h_text)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = align_center
+        cell.border = thin_border
+    
+    for idx, item in enumerate(items, 1):
+        row_num = idx + 1
+        data = [idx, item['no'], item['name'], item['usage'], item['mat'], item['ton'], item['cavity'], item['weight'], item['remarks']]
+        for col_idx, val in enumerate(data, 1):
+            cell = ws_summary.cell(row=row_num, column=col_idx, value=val)
+            cell.alignment = align_center
+            cell.border = thin_border
+    
+    ws_summary.column_dimensions['B'].width = 25
+    ws_summary.column_dimensions['C'].width = 35
+    ws_summary.column_dimensions['E'].width = 15
+
+    # [2] 상세 시트 생성 (부품 하나당 시트 하나씩)
     for item in items:
         safe_title = str(item['no']).replace("/", "_").replace("*", "")[:30]
         if "비고" in safe_title or "REMARK" in safe_title: continue
@@ -358,33 +397,27 @@ def generate_excel_file(common, items, sel_year):
     output = io.BytesIO(); wb.save(output); return output.getvalue()
 
 # ============================================================================
-# 5. Streamlit UI (통합 버전)
+# 5. Streamlit UI (통합)
 # ============================================================================
 st.set_page_config(page_title="원가계산서(통합)", layout="wide")
-st.title("원가계산서 (단품/수동 + 자동분해 통합본)")
+st.title("원가계산서 (단품/수동 + ASSY 자동분해)")
 
-# 세션 초기화
 if 'manual_items' not in st.session_state: st.session_state.manual_items = []
 if 'assy_dict' not in st.session_state: st.session_state.assy_dict = {}
 if 'common_car' not in st.session_state: st.session_state.common_car = ""
 if 'common_vol' not in st.session_state: st.session_state.common_vol = 0
 if 'excel_data' not in st.session_state: st.session_state.excel_data = None
 
-# 모드 선택
 mode = st.radio("작업 모드 선택", ["단품 계산", "ASSY(수동 입력)", "PART LIST 엑셀 업로드(Matrix)"], horizontal=True)
 
-# ----------------------------------------------------------------------------
-# [MODE 1 & 2] 단품 및 수동 입력 모드
-# ----------------------------------------------------------------------------
+# [MODE 1 & 2] 단품 및 수동 입력
 if mode in ["단품 계산", "ASSY(수동 입력)"]:
     st.info("💡 직접 데이터를 입력하여 계산서를 만듭니다.")
     
-    # 공통 정보
     c1, c2, c3 = st.columns(3)
     car = c1.text_input("차종", value=st.session_state.common_car)
     base_vol = c2.number_input("기본 Volume (대)", value=int(st.session_state.common_vol) if st.session_state.common_vol else 0)
 
-    # 초기 데이터 세팅
     if mode == "단품 계산" and not st.session_state.manual_items:
         st.session_state.manual_items = [{"id":str(uuid.uuid4()), "level":"사출제품", "no":"", "name":"", "opt_rate":100.0, "usage":1.0, "L":0.0, "W":0.0, "H":0.0, "thick":2.5, "weight":0.0, "mat":"무도장 TPO", "ton":1300, "cavity":1, "price":2000}]
     
@@ -392,7 +425,6 @@ if mode in ["단품 계산", "ASSY(수동 입력)"]:
         if st.button("➕ 품목 추가"):
             st.session_state.manual_items.append({"id":str(uuid.uuid4()), "level":"사출제품", "no":"", "name":"", "opt_rate":100.0, "usage":1.0, "L":0.0, "W":0.0, "H":0.0, "thick":2.5, "weight":0.0, "mat":"무도장 TPO", "ton":1300, "cavity":1, "price":2000})
 
-    # 입력 폼
     for i, item in enumerate(st.session_state.manual_items):
         uid = item['id']
         with st.container(border=True):
@@ -431,11 +463,9 @@ if mode in ["단품 계산", "ASSY(수동 입력)"]:
         if excel_bytes:
             st.download_button("📥 다운로드", excel_bytes, "Manual_Cost.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ----------------------------------------------------------------------------
 # [MODE 3] PART LIST 엑셀 업로드 (Matrix)
-# ----------------------------------------------------------------------------
 else:
-    st.info("💡 엑셀을 올리면 기둥(Column)별로 ASSY를 자동 분리하여 ZIP으로 줍니다.")
+    st.info("💡 엑셀을 올리면 기둥(Column)별로 분리 + 'ASSY 집계표'가 포함된 파일을 생성합니다.")
     
     uploaded_file = st.file_uploader("PART LIST 파일 업로드", type=["xlsx", "xls"])
     if uploaded_file:
